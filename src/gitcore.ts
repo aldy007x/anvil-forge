@@ -32,8 +32,9 @@ export function sha1Hex(data: Buffer): string {
 
 /** Hash an object's framed bytes without storing it. */
 export function hashObject(type: GitObjectType, data: Buffer): string {
-  const frame = Buffer.concat([Buffer.from(`${type} ${data.length}\0`, 'latin1'), data]);
-  return sha1Hex(frame);
+  // Two update() calls hash the same framed bytes a Buffer.concat would,
+  // without copying the payload first.
+  return createHash('sha1').update(`${type} ${data.length}\0`, 'latin1').update(data).digest('hex');
 }
 
 /** Insert an object into the database and return its id. Idempotent. */
@@ -51,8 +52,20 @@ export interface TreeEntry {
   sha: string;
 }
 
+/**
+ * Parsed views of stored object bodies, keyed by the body buffer itself.
+ * Object bodies in a database are never mutated after being stored, so a
+ * parse is a pure function of the buffer and can be shared by every walk
+ * that touches the object (reachability, closures, listings). Callers must
+ * treat the returned structures as read-only, as they already do.
+ */
+const treeParseCache = new WeakMap<Buffer, TreeEntry[]>();
+const commitParseCache = new WeakMap<Buffer, CommitInfo>();
+
 /** Parse a raw tree object body into entries, in stored order. */
 export function parseTree(data: Buffer): TreeEntry[] {
+  const cached = treeParseCache.get(data);
+  if (cached !== undefined) return cached;
   const entries: TreeEntry[] = [];
   let pos = 0;
   while (pos < data.length) {
@@ -64,6 +77,7 @@ export function parseTree(data: Buffer): TreeEntry[] {
     entries.push({ mode, name, sha });
     pos = nul + 21;
   }
+  treeParseCache.set(data, entries);
   return entries;
 }
 
@@ -140,6 +154,8 @@ export interface CommitInfo {
 
 /** Parse a raw commit body. Header lines end at the first blank line. */
 export function parseCommit(data: Buffer): CommitInfo {
+  const cached = commitParseCache.get(data);
+  if (cached !== undefined) return cached;
   const text = data.toString('utf8');
   const split = text.indexOf('\n\n');
   const header = split === -1 ? text : text.slice(0, split);
@@ -151,6 +167,7 @@ export function parseCommit(data: Buffer): CommitInfo {
     else if (line.startsWith('author ')) info.author = line.slice(7);
     else if (line.startsWith('committer ')) info.committer = line.slice(10);
   }
+  commitParseCache.set(data, info);
   return info;
 }
 
@@ -195,7 +212,25 @@ export function ancestorSet(db: ObjectDb, tip: string): Set<string> {
 }
 
 export function isAncestor(db: ObjectDb, ancestor: string, tip: string): boolean {
-  return ancestorSet(db, tip).has(peelToCommit(db, ancestor));
+  // The same membership question ancestorSet answers, but the walk stops
+  // the moment the target turns up: a fast-forward check (the hot caller)
+  // usually finds it one step below the tip instead of walking the whole
+  // history to build a set it would only probe once.
+  const target = peelToCommit(db, ancestor);
+  const seen = new Set<string>();
+  const stack = [peelToCommit(db, tip)];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    if (seen.has(current)) continue;
+    const object = db.get(current);
+    // ancestorSet only ever contains commits (it skips anything else
+    // before adding), so only commits can match the target.
+    if (object === undefined || object.type !== 'commit') continue;
+    seen.add(current);
+    if (current === target) return true;
+    for (const parent of parseCommit(object.data).parents) stack.push(parent);
+  }
+  return false;
 }
 
 /**
@@ -497,12 +532,48 @@ export function buildPack(objects: Array<{ type: GitObjectType; data: Buffer }>)
 }
 
 /**
- * Inflate exactly one zlib stream starting at `offset`. Node's inflateSync
- * ignores trailing bytes, so the consumed length is found by growing a
- * window until inflation succeeds and then binary-searching the cut point;
- * a truncated stream can never inflate, so the minimum that works is exact.
+ * Inflate exactly one zlib stream starting at `offset`, knowing where it
+ * ends. The fast path inflates the rest of the buffer once with zlib's
+ * `info` mode: the engine reports exactly how many input bytes the stream
+ * consumed, so no window search is needed. (The search this replaces made
+ * a dozen inflate attempts per object, and every truncated-window attempt
+ * pays zlib's exception path — together they dominated pack parsing.)
+ * The result is only trusted when it is fully consistent — the consumed
+ * count lands inside the buffer and the inflated length equals the size
+ * the pack header declared; anything else (a corrupt or truncated stream,
+ * an engine that does not report) falls back to the window search, which
+ * reproduces the original behavior and errors exactly.
  */
-function inflateOne(buf: Buffer, offset: number): { data: Buffer; next: number } {
+function inflateOne(buf: Buffer, offset: number, expectedSize?: number): { data: Buffer; next: number } {
+  try {
+    const result = inflateSync(buf.subarray(offset), { info: true }) as unknown as {
+      buffer?: Buffer;
+      engine?: { bytesWritten?: unknown };
+    };
+    const consumed = result.engine?.bytesWritten;
+    if (
+      result.buffer !== undefined &&
+      typeof consumed === 'number' &&
+      Number.isSafeInteger(consumed) &&
+      consumed > 0 &&
+      offset + consumed <= buf.length &&
+      (expectedSize === undefined || result.buffer.length === expectedSize)
+    ) {
+      return { data: result.buffer, next: offset + consumed };
+    }
+  } catch {
+    // Not a readable stream here; the search below reports it properly.
+  }
+  return inflateOneBySearch(buf, offset);
+}
+
+/**
+ * The window-search inflate: Node's inflateSync ignores trailing bytes, so
+ * the consumed length is found by growing a window until inflation
+ * succeeds and then binary-searching the cut point; a truncated stream
+ * can never inflate, so the minimum that works is exact.
+ */
+function inflateOneBySearch(buf: Buffer, offset: number): { data: Buffer; next: number } {
   let lo = offset;
   let hi = Math.min(buf.length, offset + 64);
   for (;;) {
@@ -600,7 +671,13 @@ export function parsePack(buf: Buffer, db: ObjectDb): ParsedPack {
     const start = offset;
     let byte = buf[offset++]!;
     const typeCode = (byte >> 4) & 0x07;
-    while ((byte & 0x80) !== 0) byte = buf[offset++]!;
+    let size = byte & 0x0f;
+    let shift = 4;
+    while ((byte & 0x80) !== 0) {
+      byte = buf[offset++]!;
+      size |= (byte & 0x7f) << shift;
+      shift += 7;
+    }
     let baseOffset: number | undefined;
     let baseSha: string | undefined;
     if (typeCode === 6) {
@@ -616,7 +693,7 @@ export function parsePack(buf: Buffer, db: ObjectDb): ParsedPack {
       baseSha = buf.toString('hex', offset, offset + 20);
       offset += 20;
     }
-    const inflated = inflateOne(buf, offset);
+    const inflated = inflateOne(buf, offset, size);
     offset = inflated.next;
     raw.push({ offset: start, typeCode, data: inflated.data, baseOffset, baseSha });
   }
