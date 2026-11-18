@@ -1,0 +1,6 @@
+# The downloaded competition kit is reference material, not part of the entry.
+kit/
+out/
+node_modules/
+state.json
+*.log
